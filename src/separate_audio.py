@@ -1,3 +1,4 @@
+import json
 import io
 from itertools import groupby
 from itertools import cycle
@@ -31,11 +32,11 @@ from mutagen.mp3 import MP3
 
 import soundfile as sf
 
-INPUT_DIR = "/analyze/audio/input/"
-OUTPUT_DIR = "/analyze/audio/output/"
-PLOT = "/analyze/plot/"
+INPUT_DIR = "/analyze/audio/"
+RESULT = '/analyze/result/'
 INTERVAL = 3
 TIMES = 1000
+MAX_AUDIO_LENGTH = 5400
 
 _default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 _my_colors = np.array([
@@ -68,14 +69,6 @@ def check_or_make_dir(audio_dir):
     if not os.path.isdir(audio_dir):
         os.makedirs(audio_dir)
 
-def return_sound(sound, start):
-    f = io.BytesIO()
-    sound[start*TIMES:(start+INTERVAL)*TIMES].export(f, format='wav')
-    f.seek(0)
-    tmp = io.BytesIO(f.read())
-    data, source_sr = sf.read(tmp)
-    return data
-
 def plot_projections(embeds, speakers, ax=None, colors=None, markers=None, legend=True, 
                      title="", **kwargs):
     if ax is None:
@@ -102,7 +95,6 @@ def plot_projections(embeds, speakers, ax=None, colors=None, markers=None, legen
     ax.set_yticks([])
     ax.set_aspect("equal")
     
-    print(projs)
     return projs
 
 def get_min_index(cluster_centers, all_data_set):
@@ -130,6 +122,7 @@ def group(L):
     yield first, last # Yield the last group
 
 def separate_continuous_sound(speaker_wav_dict_list):
+
     new_dict = {}
     neo_new_dict = []
     for speaker_wav_dict in speaker_wav_dict_list:
@@ -197,36 +190,6 @@ def generate_sound_index_list(data_list):
     #neo_new_dict = [el for el in neo_new_dict if el['len']>=2]
     return neo_new_dict
 
-def get_speaker_wav_path_dict(sound_index, speaker_wav_dict_list, wav_fpaths):
-
-    speaker_wav_path_dict = {}
-    for speaker_wav_dict in speaker_wav_dict_list:
-        print(speaker_wav_dict['speaker'])
-        file_name = f"{sound_index}-"\
-                    f"{('00'+str(speaker_wav_dict['index']))[-3:]}-"\
-                    f"{('0'+str(speaker_wav_dict['speaker']))[-2:]}-"\
-                    f"{('00'+str(speaker_wav_dict['speaker_index']))[-3:]}"
-        print(len(wav_fpaths))
-        print(speaker_wav_dict['group'][-1])
-        if len(wav_fpaths) == speaker_wav_dict['group'][-1]:
-            speaker_wav_dict['group'] = speaker_wav_dict['group'][:-1]
-        speaker_wav_path_dict[file_name] = [ wav_fpaths[i] for i in speaker_wav_dict['group'] ]
-    return speaker_wav_path_dict
-        
-def merge_and_save_sound(audio_dir, speaker_wav_path_dict):
-    
-    merge_sound = AudioSegment.empty()
-    for speaker, sound_list in speaker_wav_path_dict.items():
-        print(speaker)
-        for sound in sound_list:
-            print(type(sound))
-            merge_sound += sound
-        merge_sound.export(f"{OUTPUT_DIR}{audio_dir}{speaker}.wav", format="wav")
-        merge_sound = AudioSegment.empty()
-
-
-
-
 '-------------------------------------------------------------------------------------------------'
 
 def get_processed_sound(input_audio):
@@ -238,7 +201,7 @@ def get_processed_sound(input_audio):
 
 def get_sound_list(sound, begin, end):
 
-    sound_list = [ sound[start*TIMES:(start+INTERVAL)*TIMES ] for start in range(begin, end, INTERVAL)]
+    sound_list = [ sound[start*TIMES:(start+INTERVAL)*TIMES] for start in range(begin, end, INTERVAL) ]
     return sound_list
 
 def get_sound_feature_matrix(sound_list):
@@ -266,39 +229,41 @@ def create_pipeline(list_functions):
         return res
     return pipeline
 
+check_or_make_dir(RESULT)
 for root, dirs, files in os.walk(INPUT_DIR):
-    print(files)
     for audio_file in files:
 
-        audio_dir = f"{audio_file.split('.')[0]}/"
-        check_or_make_dir(f"{OUTPUT_DIR}{audio_dir}")
-        check_or_make_dir(f"{PLOT}{audio_dir}")
-
-        input_audio = f"{INPUT_DIR}{audio_file}"
-
-        total_sound_length = get_audio_length(input_audio)
-        sound_length_list = [ length for length in range(0, total_sound_length, 3600)]
+        timestamp_json = f"{audio_file.split('.')[0]}.json"
+        audio_file = os.path.join(root, audio_file)
+        total_sound_length = get_audio_length(audio_file)
+        sound_length_list = [ length for length in range(0, total_sound_length, MAX_AUDIO_LENGTH)]
         sound_length_set_list = {
             i:(
                 length,
                 sound_length_list[i+1] if i < len(sound_length_list)-1 else total_sound_length 
             )
             for i, length in enumerate(sound_length_list) }
-        print(sound_length_set_list)
 
-        sound = get_processed_sound(input_audio)
+        timestamp_list = []
+        sound = get_processed_sound(audio_file)
+        sound_list_list = [ 
+                get_sound_list(sound, partial_sound_len[0], partial_sound_len[1])
+                for index, partial_sound_len in sound_length_set_list.items()
+            ]
+        sound = None
+
         for sound_index, partial_sound_len in sound_length_set_list.items():
 
             begin = partial_sound_len[0]
             end = partial_sound_len[1]
 
-            sound_list = get_sound_list(sound, begin, end)
+            sound_list = sound_list_list[sound_index]
             wavs = get_sound_feature_matrix(sound_list)
             speakers = ['audio' for i in range(begin, end, INTERVAL)]
             utterance_embeds = get_utterance_embeds(wavs)
 
             X = plot_projections(utterance_embeds, speakers, title="Embedding projections")
-            plt.savefig(f"{PLOT}{audio_dir}{sound_index}-plot_1.png")
+            plt.savefig(f"{RESULT}{sound_index}-plot_1.png")
 
             bandwidth = estimate_bandwidth(X, quantile=0.05, n_samples=len(speakers))
 
@@ -310,32 +275,23 @@ for root, dirs, files in os.walk(INPUT_DIR):
             labels_unique = np.unique(labels)
             n_clusters_ = len(labels_unique)
 
-            print("number of estimated clusters : %d" % n_clusters_)
-                    
             index_list = get_min_index(cluster_centers, X)
 
             plt.figure(1)
             plt.clf()
 
             colors = cycle('bgrcmykbgrcmykbgrcmykbgrcmyk')
-            index_list_set = []
             file_list_set = []
             for k, col in zip(range(n_clusters_), colors):
                 my_members = labels == k
-                print(k)
-                print([ index for index, val in enumerate(my_members) if val] )
                 file_list_set.append({k: [ index for index, val in enumerate(my_members) if val]})
-                index_list_set.extend([ (k, index) for index, val in enumerate(my_members) if val ])
                 cluster_center = cluster_centers[k]
                 plt.plot(X[my_members, 0], X[my_members, 1], col + '.')
                 plt.plot(cluster_center[0], cluster_center[1], 'o', markerfacecolor=col,
                         markeredgecolor='k', markersize=14)
 
-            print(file_list_set)
-            index_list_set = sorted(index_list_set, key=lambda item: item[1])
-
             plt.title('Estimated number of clusters: %d' % n_clusters_)
-            plt.savefig(f"{PLOT}{audio_dir}{sound_index}-plot_2.png")
+            plt.savefig(f"{RESULT}{sound_index}-plot_2.png")
 
             pipeline = create_pipeline([
                 separate_continuous_sound,
@@ -345,8 +301,7 @@ for root, dirs, files in os.walk(INPUT_DIR):
             ])
 
             sound_index_list = pipeline(file_list_set)
+            timestamp_list.append(sound_index_list)
 
-            for index in sound_index_list:
-                print(index)
-            speaker_wav_path_dict = get_speaker_wav_path_dict(sound_index, sound_index_list, sound_list)
-            merge_and_save_sound(audio_dir, speaker_wav_path_dict)
+        with open(f"{RESULT}{timestamp_json}", "w") as r:
+            r.write(json.dumps(timestamp_list))
